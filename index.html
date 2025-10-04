@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SkyWatch - Thermal Agriculture Map</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background: url('Sky.svg') no-repeat center center fixed;
+  background-size: cover;
+  color: white;
+  text-align: center;
+}
+.container { max-width: 900px; margin: 0 auto; padding: 20px; }
+.card {
+  background: rgba(255,255,255,0.15);
+  border-radius: 20px;
+  padding: 20px;
+  margin: 10px;
+  backdrop-filter: blur(10px);
+  box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+}
+.forecast { display: flex; justify-content: space-around; margin-top: 20px; flex-wrap: wrap; }
+.forecast .card { flex: 1; margin: 10px; }
+canvas { margin-top: 20px; }
+button {
+  margin: 5px;
+  padding: 8px 16px;
+  border: none;
+  border-radius: 12px;
+  background: rgba(255,255,255,0.3);
+  color: white;
+  font-size: 14px;
+  cursor: pointer;
+  backdrop-filter: blur(5px);
+  transition: 0.3s;
+}
+button:hover { background: rgba(255,255,255,0.5); }
+#alert { font-size: 18px; font-weight: bold; }
+.red { background: rgba(255,0,0,0.5) !important; }
+.orange { background: rgba(255,165,0,0.5) !important; }
+.yellow { background: rgba(255,255,0,0.4) !important; color: black !important; }
+#miniMap { height: 300px; width: 100%; border-radius: 15px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>☁️ SkyWatch</h1>
+
+  <div id="weather" class="card">
+    <h2 id="temp">--°C</h2>
+    <p id="location">Detecting location...</p>
+    <p id="condition">Loading...</p>
+    <p id="time"></p>
+    <button onclick="refreshWeather()">🔄 Refresh</button>
+  </div>
+
+  <div id="alertCard" class="card">
+    <h2 id="alert">No alerts</h2>
+    <p id="severity"></p>
+    <canvas id="alertChart" height="100"></canvas>
+  </div>
+
+  <div class="forecast" id="forecast"></div>
+
+  <div class="card">
+    <canvas id="tempChart"></canvas>
+  </div>
+
+  <div class="card">
+    <h2>Agriculture Map</h2>
+    <div id="miniMap"></div>
+    <div>
+      <button onclick="generateThermalLayer('heat')">Heat Map</button>
+      <button onclick="generateThermalLayer('fertility')">Soil Fertility Map</button>
+      <button onclick="generateThermalLayer('moisture')">Soil Moisture Map</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let chart, alertChart;
+let map, thermalLayer;
+let userLat, userLon;
+let heatGrid = {}; // store stable heat/fertility/moisture values by lat/lon grid
+
+// --- Disaster Alerts ---
+function getRandomAlert() {
+  if(Math.random()<0.75) return { alert:"No Alerts", severity:{level:"", class:""}, chartData:null };
+  const alerts=[
+    {text:"🌧️ Heavy Rain", duration:4, class:"yellow"},
+    {text:"⛈️ Storm", duration:3, class:"orange"},
+    {text:"🌊 Flood", duration:6, class:"red"},
+    {text:"🏔️ Landslide", duration:5, class:"orange"},
+    {text:"🌪️ Strong Wind", duration:4, class:"yellow"},
+    {text:"🔥 Heatwave", duration:8, class:"red"}
+  ];
+  const selected = alerts[Math.floor(Math.random()*alerts.length)];
+  const hours=[], intensity=[];
+  let startHour=Math.floor(Math.random()*24);
+  for(let i=0;i<=selected.duration;i++){
+    let h=(startHour+i)%24;
+    hours.push(h.toString().padStart(2,'0')+":00");
+    intensity.push(Math.floor(Math.random()*100));
+  }
+  return { alert:selected.text, severity:{level:`⏰ Duration: ${selected.duration} hours`, class:selected.class}, chartData:{labels:hours,data:intensity}};
+}
+
+// --- Fetch Weather ---
+async function fetchWeather(lat, lon){
+  try{
+    const url=`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current_weather=true&hourly=temperature_2m,relative_humidity_2m&daily=temperature_2m_max,temperature_2m_min,relative_humidity_2m_max,precipitation_sum,weathercode&timezone=auto`;
+    const res=await fetch(url);
+    const data=await res.json();
+
+    document.getElementById("temp").textContent=`${data.current_weather.temperature}°C`;
+    document.getElementById("condition").textContent=weatherCodeToText(data.current_weather.weathercode);
+    document.getElementById("time").textContent=new Date(data.current_weather.time).toLocaleString();
+    document.getElementById("location").textContent=`Lat: ${lat.toFixed(2)}, Lon: ${lon.toFixed(2)}`;
+
+    // Forecast
+    const forecastDiv=document.getElementById("forecast"); forecastDiv.innerHTML="";
+    for(let i=0;i<3;i++){
+      const date=data.daily.time[i]; const humidity=data.daily.relative_humidity_2m_max[i];
+      forecastDiv.innerHTML+=`<div class="card"><p>${date}</p><p>Humidity: ${humidity}%</p></div>`;
+    }
+
+    // Temperature Chart
+    const hours=data.hourly.time.map(t=>t.split("T")[1]).slice(0,24);
+    const temps=data.hourly.temperature_2m.slice(0,24);
+    const ctx=document.getElementById("tempChart").getContext("2d");
+    if(chart) chart.destroy();
+    chart=new Chart(ctx,{type:"line",data:{labels:hours,datasets:[{label:"Temperature (°C)",data:temps,borderColor:"#fff",backgroundColor:"rgba(255,255,255,0.3)",fill:true,tension:0.3}]},options:{scales:{x:{ticks:{color:"#fff"}},y:{ticks:{color:"#fff"}}},plugins:{legend:{labels:{color:"#fff"}}}}});
+
+    // Disaster Alert
+    const {alert,severity,chartData}=getRandomAlert();
+    const alertCard=document.getElementById("alertCard");
+    const alertText=document.getElementById("alert");
+    const severityText=document.getElementById("severity");
+    alertText.textContent=alert; severityText.textContent=severity.level;
+    if(alert==="No Alerts"){ alertCard.className="card"; if(alertChart) alertChart.destroy(); }
+    else{ alertCard.className="card "+severity.class;
+      const ctxAlert=document.getElementById("alertChart").getContext("2d");
+      if(alertChart) alertChart.destroy();
+      alertChart=new Chart(ctxAlert,{type:"line",data:{labels:chartData.labels,datasets:[{label:"Intensity (%)",data:chartData.data,borderColor:"#fff",backgroundColor:"rgba(255,255,255,0.3)",fill:true,tension:0.3}]},options:{scales:{x:{ticks:{color:"#fff"}},y:{ticks:{color:"#fff",max:100,min:0}}},plugins:{legend:{labels:{color:"#fff"}}}}});
+    }
+
+  }catch(err){ console.error("Weather fetch failed:",err); }
+}
+
+function weatherCodeToText(code){
+  const codes={0:"Clear sky",1:"Mainly clear",2:"Partly cloudy",3:"Overcast",45:"Fog",48:"Rime fog",51:"Light drizzle",61:"Slight rain",63:"Moderate rain",65:"Heavy rain",71:"Snow fall",95:"Thunderstorm"};
+  return codes[code]||"Unknown";
+}
+
+function refreshWeather(){ if(userLat && userLon) fetchWeather(userLat,userLon); }
+
+// --- Default Test Location ---
+function useDefaultLocation() {
+  userLat = 9.9816;  // Ernakulam lat
+  userLon = 76.2999; // Ernakulam lon
+  document.getElementById("location").textContent = "Using default location (Ernakulam)";
+  fetchWeather(userLat,userLon);
+  initMap(userLat,userLon);
+}
+
+// --- Get User Location ---
+function getUserLocation(){
+  if(navigator.geolocation){
+    navigator.geolocation.getCurrentPosition(
+      pos=>{ 
+        userLat=pos.coords.latitude; 
+        userLon=pos.coords.longitude; 
+        fetchWeather(userLat,userLon); 
+        initMap(userLat,userLon); 
+      },
+      err=>{ 
+        console.warn("Geolocation failed, using default location");
+        useDefaultLocation(); 
+      }
+    );      
+  } else { 
+    console.warn("Geolocation not supported, using default location");
+    useDefaultLocation(); 
+  }      
+}
+
+// --- Map ---
+function initMap(lat,lon){
+  map=L.map('miniMap').setView([lat,lon],15);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{ attribution:'© OpenStreetMap contributors'}).addTo(map);
+  generateThermalLayer('heat'); // default
+  map.on('moveend', ()=>{ generateThermalLayer(currentMapType); });
+}
+
+// --- Stable Agriculture Heatmaps ---
+let currentMapType = 'heat';
+
+function generateThermalLayer(type='heat'){
+  currentMapType = type;
+  if(thermalLayer) thermalLayer.remove();
+  thermalLayer = L.layerGroup();
+
+  const bounds = map.getBounds();
+  const latMin = bounds.getSouth();
+  const latMax = bounds.getNorth();
+  const lonMin = bounds.getWest();
+  const lonMax = bounds.getEast();
+
+  const rows = 50;
+  const cols = 50;
+  const latStep = (latMax - latMin) / rows;
+  const lonStep = (lonMax - lonMin) / cols;
+
+  for(let i=0;i<rows;i++){
+    for(let j=0;j<cols;j++){
+      const lat = latMin + i*latStep + latStep/2;
+      const lon = lonMin + j*lonStep + lonStep/2;
+      const key = `${type}_${i}_${j}_${map.getZoom()}`;
+
+      let value;
+      if(heatGrid[key] !== undefined){
+        value = heatGrid[key];
+      } else {
+        const neighborValues = [];
+        if(i>0 && heatGrid[`${type}_${i-1}_${j}_${map.getZoom()}`]!==undefined) neighborValues.push(heatGrid[`${type}_${i-1}_${j}_${map.getZoom()}`]);
+        if(j>0 && heatGrid[`${type}_${i}_${j-1}_${map.getZoom()}`]!==undefined) neighborValues.push(heatGrid[`${type}_${i}_${j-1}_${map.getZoom()}`]);
+        const base = neighborValues.length>0 ? neighborValues.reduce((a,b)=>a+b,0)/neighborValues.length : 50;
+        value = Math.max(0, Math.min(100, base + (Math.random()*20-10)));
+        heatGrid[key] = value;
+      }
+
+      // Map intensity to color based on type
+      let color;
+      if(type==='heat'){
+        if(value>=90) color='rgba(255,0,0,0.7)';
+        else if(value>=70) color='rgba(255,69,0,0.6)';
+        else if(value>=50) color='rgba(255,165,0,0.5)';
+        else if(value>=30) color='rgba(255,255,0,0.4)';
+        else color='rgba(0,255,0,0.4)';
+      } else if(type==='fertility'){
+        if(value>=90) color='rgba(0,128,0,0.7)';
+        else if(value>=70) color='rgba(34,139,34,0.6)';
+        else if(value>=50) color='rgba(60,179,113,0.5)';
+        else if(value>=30) color='rgba(144,238,144,0.4)';
+        else color='rgba(224,255,224,0.4)';
+      } else if(type==='moisture'){
+        if(value>=90) color='rgba(0,0,255,0.7)';
+        else if(value>=70) color='rgba(30,144,255,0.6)';
+        else if(value>=50) color='rgba(135,206,250,0.5)';
+        else if(value>=30) color='rgba(173,216,230,0.4)';
+        else color='rgba(224,255,255,0.4)';
+      }
+
+      L.rectangle(
+        [[lat-latStep/2, lon-lonStep/2],[lat+latStep/2, lon+lonStep/2]],
+        { color: color, weight: 0, fillColor: color, fillOpacity:0.6 }
+      ).addTo(thermalLayer);
+    }
+  }
+
+  thermalLayer.addTo(map);
+}
+
+getUserLocation();
+</script>
+</body>
+</html>
